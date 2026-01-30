@@ -1,22 +1,87 @@
 const express = require("express");
 const bodyParser = require("body-parser");
+const axios = require("axios");
+const { v4: uuidv4 } = require("uuid");
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 
-// Health check
-app.get("/", (req, res) => {
-  res.status(200).send("Branded + Flow phone assistant running");
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
+
+// Simple in-memory audio store (mp3 buffers). Good enough to ship v1.
+const audioStore = new Map();
+// TTL cleanup (10 minutes)
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, obj] of audioStore.entries()) {
+    if (now - obj.createdAt > 10 * 60 * 1000) audioStore.delete(id);
+  }
+}, 60 * 1000);
+
+app.get("/", (req, res) => res.status(200).send("bnf-phone-assistant running"));
+
+async function elevenLabsTTSMp3Buffer(text) {
+  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
+    throw new Error("Missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID");
+  }
+
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?output_format=mp3_44100_128`;
+
+  const resp = await axios.post(
+    url,
+    {
+      text,
+      model_id: "eleven_multilingual_v2"
+    },
+    {
+      responseType: "arraybuffer",
+      headers: {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+
+  return Buffer.from(resp.data);
+}
+
+// Serve generated audio back to Twilio
+app.get("/audio/:id.mp3", (req, res) => {
+  const obj = audioStore.get(req.params.id);
+  if (!obj) return res.status(404).send("Not found");
+
+  res.set("Content-Type", "audio/mpeg");
+  res.set("Cache-Control", "no-store");
+  res.send(obj.buffer);
 });
 
-// Twilio voice webhook — MUST be strict TwiML
-app.post("/twilio/voice", (req, res) => {
-  res.set("Content-Type", "text/xml");
-  res.send('<?xml version="1.0" encoding="UTF-8"?><Response><Say>Hi, thanks for calling Branded plus Flow. I\'m the assistant. How can I help you today?</Say></Response>');
+// Twilio entrypoint
+app.post("/twilio/voice", async (req, res) => {
+  try {
+    const greeting =
+      "Hi, thanks for calling Branded and Flow. I'm the assistant. How can I help you today?";
+
+    const mp3 = await elevenLabsTTSMp3Buffer(greeting);
+    const id = uuidv4();
+    audioStore.set(id, { buffer: mp3, createdAt: Date.now() });
+
+    const publicBase = "https://bnf-phone-assistant.onrender.com";
+    const audioUrl = `${publicBase}/audio/${id}.mp3`;
+
+    // Twilio is strict: no leading whitespace before XML declaration.
+    res.set("Content-Type", "text/xml");
+    res.send(
+      `<?xml version="1.0" encoding="UTF-8"?><Response><Play>${audioUrl}</Play></Response>`
+    );
+  } catch (err) {
+    // Fallback if ElevenLabs fails
+    res.set("Content-Type", "text/xml");
+    res.send(
+      `<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we are having trouble right now. Please call back in a moment.</Say></Response>`
+    );
+  }
 });
 
-// Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("Listening on port", PORT);
-});
+app.listen(PORT, "0.0.0.0", () => console.log("Listening on", PORT));
